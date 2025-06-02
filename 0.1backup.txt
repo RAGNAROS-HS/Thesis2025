@@ -1,0 +1,159 @@
+import os
+import cv2
+import json
+import numpy as np
+import geopandas as gpd
+import shapely
+import shapely.affinity
+from shapely.geometry import shape
+from PIL import Image
+
+# Constants
+DEFAULT_HEIGHT_M = 10.0
+MIN_SHADOW_PIXELS = 10
+MIN_BUILDING_AREA_M2 = 20.0
+MAX_SUN_ELEVATION = 70.0
+UNCERTAIN_PROB = 0.5
+
+# -------------------------
+# Utility Functions
+# -------------------------
+
+def load_metadata():
+    with open("metadata/sun_angles.json") as f:
+        meta = json.load(f)
+    return meta["pre_event"], meta["post_event"]
+
+def adaptive_shadow_mask(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        blockSize=21, C=10
+    )
+    kernel = np.ones((3, 3), np.uint8)
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    return cleaned
+
+def compute_shadow_length(height_m, sun_elevation_deg):
+    if sun_elevation_deg <= 0:
+        return np.inf
+    return height_m / np.tan(np.radians(sun_elevation_deg))
+
+def project_shadow_polygon(geom, sun_azimuth_deg, shadow_length_m, gsd):
+    shadow_length_px = shadow_length_m / gsd
+    azimuth_rad = np.radians(sun_azimuth_deg)
+    dx = -shadow_length_px * np.sin(azimuth_rad)
+    dy = -shadow_length_px * np.cos(azimuth_rad)
+    return shapely.affinity.translate(geom, xoff=dx, yoff=dy)
+
+def count_shadow_pixels(shadow_mask, polygon):
+    h, w = shadow_mask.shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not polygon.is_valid or polygon.is_empty:
+        return 0
+    cv2.fillPoly(mask, [np.array(polygon.exterior.coords, dtype=np.int32)], 1)
+    return int(np.sum(np.logical_and(mask, shadow_mask > 0)))
+
+def shadow_loss_ratio(pre_count, post_count):
+    return max(0.0, (pre_count - post_count) / (pre_count + 1e-5))
+
+def compute_collapse_probability(slr):
+    return np.clip(slr, 0, 1)
+
+# -------------------------
+# Core Shadow Pipeline
+# -------------------------
+
+def shadow_collapse_pipeline():
+    print("[INFO] Loading metadata...")
+    pre_meta, post_meta = load_metadata()
+    sun_elev_pre = pre_meta["sun_elevation"]
+    sun_elev_post = post_meta["sun_elevation"]
+    sun_azimuth = pre_meta["sun_azimuth"]
+    gsd_pre = pre_meta["gsd"]
+    gsd_post = post_meta["gsd"]
+
+    print(f"[META] Sun Elev Pre: {sun_elev_pre}, Post: {sun_elev_post}, Azimuth: {sun_azimuth}")
+    print(f"[META] GSD Pre: {gsd_pre}, Post: {gsd_post}")
+
+    print("[INFO] Loading images...")
+    pre_img = cv2.imread("data/pre_event.png")
+    post_img = cv2.imread("data/post_event.png")
+    print(f"[IMG] Shape Pre: {pre_img.shape}, Post: {post_img.shape}")
+
+    shadow_mask_pre = adaptive_shadow_mask(pre_img)
+    shadow_mask_post = adaptive_shadow_mask(post_img)
+
+    print("[INFO] Loading and projecting buildings...")
+    gdf = gpd.read_file("data/buildings.geojson")
+
+    # Project to metric CRS for accurate area (assumes input is in EPSG:4326)
+    gdf = gdf.to_crs(epsg=3857)
+
+    h, w = pre_img.shape[:2]
+    prob_map = np.zeros((h, w), dtype=np.float32)
+
+    processed = 0
+    skipped_area = 0
+    skipped_sun = 0
+    skipped_shadow = 0
+
+    for idx, row in gdf.iterrows():
+        if idx % 10 == 0:
+            print(f"[...] Processing building {idx}/{len(gdf)}")
+        geom = row["geometry"]
+        if geom is None:
+            continue
+
+        area_m2 = geom.area
+        if area_m2 < MIN_BUILDING_AREA_M2:
+            skipped_area += 1
+            continue
+
+        if sun_elev_pre > MAX_SUN_ELEVATION or sun_elev_post > MAX_SUN_ELEVATION:
+            skipped_sun += 1
+            prob = UNCERTAIN_PROB
+        else:
+            shadow_len_pre = compute_shadow_length(DEFAULT_HEIGHT_M, sun_elev_pre)
+            shadow_len_post = compute_shadow_length(DEFAULT_HEIGHT_M, sun_elev_post)
+
+            search_poly_pre = project_shadow_polygon(geom, sun_azimuth, shadow_len_pre, gsd_pre)
+            search_poly_post = project_shadow_polygon(geom, sun_azimuth, shadow_len_post, gsd_post)
+
+            pre_count = count_shadow_pixels(shadow_mask_pre, search_poly_pre)
+            post_count = count_shadow_pixels(shadow_mask_post, search_poly_post)
+
+            if pre_count < MIN_SHADOW_PIXELS:
+                skipped_shadow += 1
+                prob = UNCERTAIN_PROB
+            else:
+                slr = shadow_loss_ratio(pre_count, post_count)
+                prob = compute_collapse_probability(slr)
+                print(f"[BUILDING {idx}] pre_shadow: {pre_count}, post_shadow: {post_count}, SLR: {slr:.2f}, Prob: {prob:.2f}")
+
+        # Paint to map
+        building_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(building_mask, [np.array(geom.exterior.coords, dtype=np.int32)], 1)
+        prob_map[building_mask > 0] = prob
+        processed += 1
+
+    print(f"[SUMMARY] Processed: {processed}")
+    print(f"[SKIPPED] Small Area: {skipped_area}, High Sun: {skipped_sun}, Shadow Too Small: {skipped_shadow}")
+    return prob_map
+
+def save_probability_map(prob_map, out_path="shadow_probability_map.png"):
+    img = (prob_map * 255).astype(np.uint8)
+    Image.fromarray(img).save(out_path)
+    print(f"[✓] Saved shadow probability map to {out_path}")
+
+# -------------------------
+# Entry Point
+# -------------------------
+
+if __name__ == "__main__":
+    print("[START] Shadow-based collapse detection")
+    prob_map = shadow_collapse_pipeline()
+    save_probability_map(prob_map)
+    print("[DONE] Analysis complete.")

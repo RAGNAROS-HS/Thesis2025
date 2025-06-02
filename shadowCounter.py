@@ -3,89 +3,132 @@ import numpy as np
 import rasterio
 import json
 from rasterio.transform import rowcol
-from shapely.geometry import Polygon, mapping
+from shapely.geometry import Polygon, mapping, shape
+from shapely.strtree import STRtree
+import fiona
+from fiona.crs import from_string
 
-# Function to preprocess the image (convert to grayscale and enhance)
+# Preprocess image
 def preprocess_image(image_path):
     image = cv2.imread(image_path)
     if image is None:
         print(f"Error: Unable to load image at {image_path}")
         return None, None, None
-    
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     enhanced = cv2.equalizeHist(gray)
-    
-    return image, gray, enhanced  # Return original image, grayscale, and enhanced
+    return image, gray, enhanced
 
-# Function to detect shadows in the enhanced grayscale image
+# Detect shadows in the grayscale image
 def detect_shadows(enhanced, threshold_value):
-    _, shadow_mask = cv2.threshold(enhanced, threshold_value, 255, cv2.THRESH_BINARY_INV)  # Detect dark areas
-    kernel = np.ones((5, 5), np.uint8)  
-    shadow_cleaned = cv2.morphologyEx(shadow_mask, cv2.MORPH_CLOSE, kernel)
-    shadow_cleaned = cv2.dilate(shadow_cleaned, kernel, iterations=1)  
-    return shadow_cleaned
+    _, mask = cv2.threshold(enhanced, threshold_value, 255, cv2.THRESH_BINARY_INV)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
 
-# Convert pixel coordinates to georeferenced (lat/lon or projected)
+# Convert pixel to geographic coordinates
 def pixel_to_geo(coords, transform):
-    geo_coords = [rasterio.transform.xy(transform, y, x) for x, y in coords]  # Convert pixel to geo-coordinates
-    return geo_coords
+    return [rasterio.transform.xy(transform, y, x) for x, y in coords]
 
-# Function to detect shadows and save as GeoJSON
-def save_shadows_geojson(image_path, geotiff_path, threshold_value, output_geojson, min_shadow_area=100):
-    original_image, gray, enhanced = preprocess_image(image_path)
-    if original_image is None or gray is None or enhanced is None:
-        return  
+# Calculate shadow length in pixels
+def calculate_shadow_length(pixels):
+    return max(np.linalg.norm(np.array(p1) - np.array(p2)) for i, p1 in enumerate(pixels) for p2 in pixels[i+1:])
 
-    shadow_mask = detect_shadows(enhanced, threshold_value)
-    
-    # Read GeoTIFF for georeferencing
-    with rasterio.open(geotiff_path) as dataset:
-        transform = dataset.transform  # Affine transform for pixel-to-geo conversion
-        crs = dataset.crs  # Get projection info
+# Load building footprints
+def load_buildings(path):
+    with fiona.open(path, 'r') as src:
+        return [feature for feature in src], src.crs
 
-    # Find contours of detected shadows
-    contours, _ = cv2.findContours(shadow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+# Main function
+def estimate_building_heights(image_path, geotiff_path, threshold, output_path, buildings_path,
+                              sun_elevation_deg=35.0, gsd=0.5, min_area=100):
+    image, gray, enhanced = preprocess_image(image_path)
+    if image is None: return
 
-    features = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area > min_shadow_area:  # Filter small noise
-            epsilon = 0.005 * cv2.arcLength(cnt, True)  # Approximate contour for smoother polygons
-            approx = cv2.approxPolyDP(cnt, epsilon, True)  
-            
-            # Convert pixel coordinates to geographic coordinates
-            pixel_coords = [(pt[0][0], pt[0][1]) for pt in approx]
-            geo_coords = pixel_to_geo(pixel_coords, transform)
+    mask = detect_shadows(enhanced, threshold)
 
-            # Create GeoJSON feature
-            feature = {
-                "type": "Feature",
-                "geometry": mapping(Polygon(geo_coords)),
-                "properties": {
-                    "shadow_area_pixels": area  
-                }
-            }
-            features.append(feature)
+    with rasterio.open(geotiff_path) as src:
+        transform = src.transform
+        crs = src.crs
 
-    # Create GeoJSON object
-    geojson_data = {
-        "type": "FeatureCollection",
-        "crs": {"type": "name", "properties": {"name": str(crs)}},  # Ensure correct CRS
-        "features": features
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    print(f"Detected {len(contours)} shadow contours")
+
+    sun_elevation_rad = np.deg2rad(sun_elevation_deg)
+    shadow_features = []
+    shadow_geometries = []
+    shadow_heights = []
+
+    for i, cnt in enumerate(contours):
+        if cv2.contourArea(cnt) < min_area:
+            continue
+        epsilon = 0.005 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        pixel_coords = [(pt[0][0], pt[0][1]) for pt in approx]
+        geo_coords = pixel_to_geo(pixel_coords, transform)
+        shadow_poly = Polygon(geo_coords)
+        shadow_length = calculate_shadow_length(pixel_coords)
+        height = shadow_length * gsd * np.tan(sun_elevation_rad)
+        shadow_geometries.append(shadow_poly)
+        shadow_heights.append(height)
+        if (i + 1) % 10 == 0:
+            print(f"Processed {i + 1}/{len(contours)} contours")
+
+    buildings, bldg_crs = load_buildings(buildings_path)
+    print(f"Loaded {len(buildings)} building footprints")
+
+    shadow_index = STRtree(shadow_geometries)
+
+    for idx, bldg in enumerate(buildings):
+        geom = shape(bldg['geometry'])
+        matches = shadow_index.query(geom.buffer(50))
+        max_height = 0
+        for match in matches:
+            i = shadow_geometries.index(match)
+            dist = geom.distance(match)
+            if dist < 50 and shadow_heights[i] > max_height:
+                max_height = shadow_heights[i]
+
+        if 'properties' not in bldg:
+            bldg['properties'] = {}
+        bldg['properties']['height_m'] = round(max_height, 2)
+        
+
+        if (idx + 1) % 10 == 0:
+            print(f"Processed {idx + 1}/{len(buildings)} buildings | Last height: {bldg['properties']['height_m']} m")
+
+    all_props = set()
+    for b in buildings:
+        all_props.update(b['properties'].keys())
+
+    schema = {
+        'geometry': 'Unknown',
+        'properties': {key: 'float' if key == 'height_m' else 'str' for key in all_props if key != 'label'}
     }
 
-    # Save to file
-    with open(output_geojson, "w") as f:
-        json.dump(geojson_data, f, indent=4)
-    
-    print(f"GeoJSON saved: {output_geojson}, Features: {len(features)}")
+    with fiona.open(output_path, 'w', driver='GeoJSON', crs=from_string(str(bldg_crs)), schema=schema) as out:
+        for bldg in buildings:
+            out.write({
+                'type': 'Feature',
+                'geometry': bldg['geometry'],
+                'properties': bldg['properties']
+            })
 
-# === CONFIGURATION ===
-tiff_image_path = r'C:\Users\Hugo\Documents\GitHub\Thesis2025\img\PREFF95000.tif'  # Input TIFF for reference
-shadow_image_path = r'C:\Users\Hugo\Documents\GitHub\Thesis2025\img\PREFF95000.tif'  # Image for shadow detection
-output_geojson_path = r'C:\Users\Hugo\Documents\GitHub\Thesis2025\output\PRE_shadows.geojson'  # Output GeoJSON path
-threshold_value = 20  # Adjusted for better detection
-min_shadow_area = 100  # Ignore very small shadows
+    print(f"Saved: {output_path}")
 
-# === RUN PROCESS ===
-save_shadows_geojson(shadow_image_path, tiff_image_path, threshold_value, output_geojson_path, min_shadow_area)
+# === CONFIG ===
+tiff_image_path = r'C:\Users\Hugo\Documents\GitHub\Thesis2025\img\PREFF95000.tif'
+shadow_image_path = tiff_image_path
+output_building_geojson_path = r'C:\Users\Hugo\Documents\GitHub\Thesis2025\output\PRE_buildings_height.geojson'
+building_geojson_path = r'C:\Users\Hugo\Documents\GitHub\Thesis2025\data\Antakya.geojson'
+threshold_value = 20
+sun_elevation_deg = 50.8
+gsd = 0.57
+min_shadow_area = 100
+
+# === RUN ===
+estimate_building_heights(
+    shadow_image_path, tiff_image_path, threshold_value,
+    output_building_geojson_path, building_geojson_path,
+    sun_elevation_deg, gsd, min_shadow_area
+)
