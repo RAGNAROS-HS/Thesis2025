@@ -1,0 +1,12 @@
+torch>=1.10
+torchvision
+albumentations>=1.0.0
+opencv-python-headless
+numpy
+pandas
+tqdm
+fsspec
+gcsfs
+google-cloud-storage
+scikit-learn
+python-json-logger
