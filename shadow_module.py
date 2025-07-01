@@ -81,8 +81,17 @@ def shadow_collapse_pipeline():
     h, w = pre_mask.shape
     prob_map = np.zeros((h, w), dtype=np.float32)
 
-    shadow_len_pre = compute_shadow_length(DEFAULT_HEIGHT_M, pre["sun_elevation"])
+    # Compute true post-event shadow length
     shadow_len_post = compute_shadow_length(DEFAULT_HEIGHT_M, post["sun_elevation"])
+
+    # Compute normalized pre shadow length using tangent ratio
+    tan_pre = np.tan(np.radians(pre["sun_elevation"]))
+    tan_post = np.tan(np.radians(post["sun_elevation"]))
+    if tan_post == 0:
+        scaling_ratio = 1
+    else:
+        scaling_ratio = tan_pre / tan_post
+    normalized_pre_len = shadow_len_post * scaling_ratio
 
     print("[INFO] Processing buildings...")
     for idx, row in gdf.iterrows():
@@ -96,7 +105,7 @@ def shadow_collapse_pipeline():
             if pre["sun_elevation"] > MAX_SUN_ELEVATION or post["sun_elevation"] > MAX_SUN_ELEVATION:
                 prob = UNCERTAIN_PROB
             else:
-                pre_proj = project_shadow(geom, shadow_len_pre, pre["sun_azimuth"], pre["gsd"])
+                pre_proj = project_shadow(geom, normalized_pre_len, pre["sun_azimuth"], pre["gsd"])
                 post_proj = project_shadow(geom, shadow_len_post, post["sun_azimuth"], post["gsd"])
 
                 pre_count = count_shadow_pixels(pre_mask, pre_proj, transform)
@@ -130,7 +139,6 @@ def save_probability_map(prob_map, out_path="output/shadow_probability_map.png",
     img = (prob_map * 255).astype(np.uint8)
     Image.fromarray(img).save(out_path)
 
-    # Save aligned GeoTIFF
     with rasterio.open("data/PREFF95000.tif") as ref:
         transform = ref.transform
         crs = ref.crs
